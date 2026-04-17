@@ -1,13 +1,20 @@
 import argparse
 import sys
 import traceback
+import logging
 from argparse import Namespace
 from datetime import datetime
 from typing import List
-from pyspark.sql import SparkSession, DataFrame, functions as F
+from pyspark.sql import SparkSession, DataFrame
 from pyspark.sql.utils import AnalysisException
 from pyspark.sql.functions import col, when
+from pyspark.sql import functions as F
 
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
 
 # To ensure all required columns are present in the final output table
 required_cols = ['file_id', 'file_original_name', 'entity_id', 'supplier_id', 'supplier_name', 'street_address', 'city', 'state', 'postal_code',
@@ -59,7 +66,7 @@ def build_ap_query(args: Namespace) -> str:
             ap.city,
             ap.state,
             ap.postal_code,
-            "USA" AS country,
+            ap.country,
             ap.phone_number,
             ap.email_address,
             ap.payment_terms,
@@ -95,22 +102,20 @@ def build_ap_query(args: Namespace) -> str:
         SELECT
             *,
             CASE
-                WHEN transaction_count = 0 THEN NULL
-                ELSE annual_target_spend / transaction_count
+                WHEN (COALESCE(total_number_of_payments_open,0) + COALESCE(total_number_of_payments_paid,0) ) = 0 THEN NULL
+                ELSE ( COALESCE(total_amount_of_payments_open,0) + COALESCE(total_amount_of_payments_paid,0) ) / (COALESCE(total_number_of_payments_open, 0) + COALESCE(total_number_of_payments_paid,0) )
             END AS average_ticket,
             COALESCE(total_number_of_payments_paid, 0)
-          + COALESCE(total_number_of_payments_due, 0)
           + COALESCE(total_number_of_payments_open, 0) AS c_total_number_of_payment,
             COALESCE(total_number_of_invoices, 0) AS c_total_number_of_invoices,
-            COALESCE(total_amount_of_payments_paid, 0.0)
-          + COALESCE(total_amount_of_payments_due, 0.0)
-          + COALESCE(total_amount_of_payments_open, 0.0) AS total_spend,
-            CASE WHEN LOWER(mapped_payment_method) = 'card' THEN COALESCE(total_amount_of_payments_paid, 0.0) ELSE 0.0 END AS total_spent_by_card,
-            CASE WHEN LOWER(mapped_payment_method) = 'eft' THEN COALESCE(total_amount_of_payments_paid, 0.0) ELSE 0.0 END AS total_spent_by_eft,
-            CASE WHEN LOWER(mapped_payment_method) = 'check' THEN COALESCE(total_amount_of_payments_paid, 0.0) ELSE 0.0 END AS total_spent_by_cheque,
-            CASE WHEN LOWER(mapped_payment_method) = 'ach' THEN COALESCE(total_amount_of_payments_paid, 0.0) ELSE 0.0 END AS total_spent_by_ach,
-            CASE WHEN LOWER(mapped_payment_method) NOT IN ('card','check','ach', 'eft') OR payment_method IS NULL
-                 THEN COALESCE(total_amount_of_payments_paid, 0.0) ELSE 0.0 END AS total_spent_by_other,
+            COALESCE(total_amount_of_payments_open, 0.0)
+          + COALESCE(total_amount_of_payments_paid, 0.0) AS total_spend,
+            CASE WHEN LOWER(mapped_payment_method) = 'card' THEN COALESCE(total_amount_of_payments_paid, 0.0) + COALESCE(total_amount_of_payments_open, 0.0) ELSE 0.0 END AS total_spent_by_card,
+            CASE WHEN LOWER(mapped_payment_method) = 'eft' THEN COALESCE(total_amount_of_payments_paid, 0.0) + COALESCE(total_amount_of_payments_open, 0.0) ELSE 0.0 END AS total_spent_by_eft,
+            CASE WHEN LOWER(mapped_payment_method) = 'check' THEN COALESCE(total_amount_of_payments_paid, 0.0) + COALESCE(total_amount_of_payments_open, 0.0) ELSE 0.0 END AS total_spent_by_cheque,
+            CASE WHEN LOWER(mapped_payment_method) = 'ach' THEN COALESCE(total_amount_of_payments_paid, 0.0) + COALESCE(total_amount_of_payments_open, 0.0) ELSE 0.0 END AS total_spent_by_ach,
+            CASE WHEN LOWER(mapped_payment_method) NOT IN ('card','check','ach', 'eft') OR mapped_payment_method IS NULL
+                 THEN COALESCE(total_amount_of_payments_paid, 0.0) + COALESCE(total_amount_of_payments_open, 0.0) ELSE 0.0 END AS total_spent_by_other,
             CASE WHEN LOWER(mapped_payment_method) = 'card' THEN 1 ELSE 0 END AS c_card_accepting_suppliers
         FROM ap_data
     ),
@@ -158,7 +163,7 @@ def upsert_gold_table(spark: SparkSession, gold_tbl: str, result_df: DataFrame, 
         spark.sql(f"DELETE FROM {gold_tbl} WHERE file_id = '{file_id}'")
     except AnalysisException:
         if not spark.catalog.tableExists(gold_tbl):
-            print(f"Gold table {gold_tbl} not found will create on write...")
+            logging.info(f"Gold table {gold_tbl} not found will create on write...")
         else:
             raise
     result_df.select(required_cols).write.mode("append").saveAsTable(gold_tbl)
@@ -166,7 +171,7 @@ def upsert_gold_table(spark: SparkSession, gold_tbl: str, result_df: DataFrame, 
 
 def matching(spark: SparkSession, input_df: DataFrame, args: Namespace) -> DataFrame:
     if args.match_type.lower() == "reltio":
-        from reltio_matcher import perform_matching
+        from reltio_matching_service import perform_matching
         return perform_matching(spark, input_df, args)
     elif args.match_type.lower() == "in-house":
         from in_house_matcher import match_with_audit
@@ -180,41 +185,69 @@ def run_pipeline(spark, args, st) -> None:
     file_id_exists_and_not_failed = spark.table(args.ap_tracker_tbl).where(F.col("file_id") == args.file_id).where(F.col("status") != "FAILED")
     if file_id_exists_and_not_failed.head(1):
         _set_task_value("skip_reason", "file is already processed...")
-        print(f"file_id = {args.file_id} already processed and its status is not FAILED. Skipping...")
+        logging.info(f"file_id = {args.file_id} already processed and its status is not FAILED. Skipping...")
         return
 
     update_audit_tbl(spark, args, 'IN-PROGRESS', 0, start_time=st, msg="")
-    print(f"Inserted tracker record for file_id = {args.file_id} with status = IN-PROGRESS")
+    logging.info(f"Inserted tracker record for file_id = {args.file_id} with status = IN-PROGRESS")
 
     # Build AP file dataframe
     file_id_df = (spark.sql(build_ap_query(args)).drop("ingestion_ts")
                   .withColumn("payment_terms", F.array(F.col("payment_terms")))
                   .withColumn("payment_method", F.array(F.col("mapped_payment_method"))))
     records = file_id_df.count()
-    print(f"file_id={args.file_id} records={records}")
+    logging.info(f"file_id={args.file_id} records={records}")
 
     # run matching...
     matched_result_df = matching(spark, file_id_df, args)
     matched_df = file_id_df.join(matched_result_df, on="supplier_id", how="left")
+    mch_df = spark.read.table(args.member_catgry_hier_tbl)
+    matched_df = (matched_df.join(mch_df, matched_df["matched_mmc_code"] == mch_df["mcc_code"], how="left")
+                  .withColumn("mcc_code", F.coalesce(F.col("mcc_code"), F.col("matched_mmc_code"))))
 
     # Merchant summary join...
-    mer_summary_df = spark.read.table(args.mer_summary_tbl)
-    result_df = matched_df.join(mer_summary_df, on="entity_id", how="left")
+    mer_summ_cols = ["entity_id", "preferred_payment_method", "propensity_score", "transaction_recency", "suggested_talking_points",
+                     "commercial_history", "commercial_recency", "avg_tran_amt", "matched_trans_count", "in_control_history", "in_control_recency",
+                     "propensity_score_label", "mmh_id", "card_acceptor"]
+    mer_summary_df = spark.read.table(args.mer_summary_tbl).select(*mer_summ_cols)
 
-    confidence_cond = when(col("matched_score") >= 0.75, "High").when(
-        (col("matched_score") < 0.75) & (col("matched_score") >= 0.7), "Medium").otherwise("Low")
-    filtered_df = result_df.withColumn("confidence", confidence_cond).select(*required_cols)
+    # result_df = matched_df.join(mer_summary_df, on="entity_id", how="left")
+    mer_summary_df = mer_summary_df.withColumnRenamed("entity_id", "mer_summary_entity_id")
+    result_df = (matched_df.join(mer_summary_df, matched_df.matched_mmhid == mer_summary_df.mmh_id, how="left")
+                 .withColumn("mmh_id", F.coalesce(F.col("mmh_id"), F.col("matched_mmhid"))))
+    result_df = (result_df.withColumnRenamed("matched_url", "supplier_website_url").withColumnRenamed("matched_sic", "sic")
+                 .withColumnRenamed("matched_street_address", "cleansed_address_line_1")
+                 .withColumnRenamed("matched_city", "cleansed_city_name").withColumnRenamed("matched_state", "Cleansed_state_Or_province_name")
+                 .withColumnRenamed("matched_country_cd", "cleansed_country_code").withColumnRenamed("matched_postal_code", "cleansed_postal_code")
+                 .withColumnRenamed("matched_agg_merch_name", "aggregate_merchant_name").withColumnRenamed("matched_agg_merch_id", "aggregate_merchant_id")
+                 .withColumnRenamed("matched_parent_agg_merch_name", "parent_aggregate_merchant_name").withColumnRenamed("matched_parent_agg_merch_id", "parent_aggregate_merchant_id")
+                 .withColumnRenamed("matched_clearing_last_seen_date", "clearing_last_seen_date")
+                 .withColumnRenamed("matched_auth_last_seen_date", "auth_last_seen_date").withColumnRenamed("matched_zi_c_last_updated_date", "last_update_date")
+                 .withColumnRenamed("matched_naics", "customer_naics").withColumnRenamed("matched_region_code", "dw_merch_region_cd")
+                 .withColumnRenamed("matched_industry", "industry")
+                 .withColumn("supplier_alias_name", col("matched_dba_name")).withColumn("cleansed_supplier_name", col("matched_dba_name"))
+                 .withColumn("business_region_name", col("matched_region_name")).withColumn("region", col("matched_region_name")))
+
+    confidence_cond = when(col("matched_score") >= 0.75, "High") \
+        .when((col("matched_score") < 0.75) & (col("matched_score") >= 0.7), "Medium").otherwise("Low")
+
+    filtered_df = (
+        result_df
+        .withColumn("confidence", confidence_cond)
+        .select(*required_cols)
+    )
 
     # Validate final result...
     validate_result(filtered_df)
-    print(f"Before inserting to GOLD table {args.so_ap_bd_tbl}")
+    logging.info(f"Before inserting to GOLD table {args.so_ap_bd_tbl}")
     upsert_gold_table(spark, args.so_ap_bd_tbl, filtered_df, args.file_id)
+    logging.info(f"Updating audit table with SUCCESS for file_id={args.file_id} and record count={records}")
     update_audit_tbl(spark, args, "SUCCESS", records, start_time=st, msg="")
-    print(f"Completed AP process for file_id={args.file_id} in {round((datetime.now() - st).total_seconds(), 2)}s")
+    logging.info(f"Completed AP process for file_id={args.file_id} in {round((datetime.now() - st).total_seconds(), 2)}s")
 
 
 def update_audit_tbl(spark, args, status, records, start_time, msg) -> None:
-    print(f"Updating the audit table {args.ap_tracker_tbl} with status {status} for file_id {args.file_id} ")
+    logging.info(f"Updating the audit table {args.ap_tracker_tbl} with status {status} for file_id {args.file_id} ")
 
     try:
         from datetime import datetime
@@ -253,7 +286,7 @@ def update_audit_tbl(spark, args, status, records, start_time, msg) -> None:
                 )
         """)
     except Exception as e:
-        print(f"failed to merge, inserting instead... {e}")
+        logging.info(f"failed to merge, inserting instead... {e}")
         spark.sql(f"""INSERT INTO {args.ap_tracker_tbl} (file_id, start_dt, last_processed_dt, total_time_taken, record_count, status, comment)
                 VALUES (
                     '{args.file_id}',
@@ -276,39 +309,43 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
     p.add_argument("--ap-raw-tbl", required=True)
     p.add_argument("--reltio-match-audit-tbl", required=True)
     p.add_argument("--mer-summary-tbl", required=True)
+    p.add_argument("--member-catgry-hier-tbl", required=True)
     p.add_argument("--so-ap-bd-tbl", required=True)
+    p.add_argument("--reltio-search-url", required=True, help="https://.../entities/_matches")
     p.add_argument("--reltio-match-url", required=True, help="https://.../entities/_matches")
     p.add_argument("--reltio-auth-url", required=True, help="https://.../entities/_matches")
+    p.add_argument("--reltio-secret-name", required=True, help="aws secret name for reltio access token")
     p.add_argument("--match-batch-size", type=int, default=200)
     p.add_argument("--match-max-concurrent-batches", type=int, default=5)
     p.add_argument("--match-max-retries", type=int, default=3)
     p.add_argument("--match-backoff-secs", type=float, default=1.0)
-    p.add_argument("--match-connect-timeout", type=int, default=5)
+    p.add_argument("--match-connect-timeout", type=int, default=120)
     p.add_argument("--match-read-timeout", type=int, default=60)
     p.add_argument("--match-cache-expiry", type=int, default=7)
+    p.add_argument("--search-max-workers", type=int, default=50)
+    p.add_argument("--min-match-score", type=float, default=0.80)
     p.add_argument("--match-type", default="reltio", help="either reltio or in-house")
     p.add_argument("--model-path", default="", help="model path for in-house matcher")
     p.add_argument("--src-clustered-tbl", default="", help="src_clustered_tbl for in-house matcher")
     p.add_argument("--in-house-audit-tbl", default="", help="audit table for in-house matcher")
+    p.add_argument("--country-map-table", default="mc_sme.bd.country_map")
+    p.add_argument("--country-alias-map-table", default="mc_sme.bd.country_alias_map")
     return p.parse_args(argv)
 
 
 def main() -> None:  # pragma no cover
     st = datetime.now()
     args = parse_args(sys.argv[1:])
-    print(f"Job started with args: {args}")
+    logging.info(f"Job started with args: {args}")
     spark = SparkSession.getActiveSession() or SparkSession.builder.appName("AP_File_Pipeline").getOrCreate()
     try:
         run_pipeline(spark, args, st)
     except Exception as e:
-        print(f"Error occurred during pipeline execution: {e}")
+        logging.error(f"Error occurred during pipeline execution: {e}")
         traceback.print_exc()
         # Failure: call audit update with FAILED
         update_audit_tbl(spark, args, "FAILED", records=0, start_time=st, msg=str(e))
         sys.exit(1)
-    finally:
-        if spark:
-            spark.stop()
 
 
 if __name__ == "__main__":  # pragma no cover

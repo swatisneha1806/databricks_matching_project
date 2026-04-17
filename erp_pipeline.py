@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import sys
 import traceback
+import logging
 from argparse import Namespace
 from datetime import datetime
 from typing import List
@@ -11,6 +12,13 @@ from pyspark.sql import SparkSession, DataFrame
 from pyspark.sql.functions import lit, col, when
 from pyspark.sql.types import DoubleType, DecimalType
 from pyspark.sql.utils import AnalysisException
+from pyspark.sql import functions as F
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
 
 # To ensure all required columns are present in the final output table
 required_cols = ['entity_id', 'supplier_name', 'merchant_id', 'date_period', 'supplier_id', 'street_address', 'city', 'state', 'postal_code',
@@ -59,50 +67,11 @@ def validate_result(result_df) -> None:
         raise ValueError(f"Unexpected columns found: {unexpected}")
 
 
-def get_last_success_dt(spark: SparkSession, audit_tbl: str) -> datetime:
-    try:
-        row = spark.sql(f"SELECT max(last_success_dt) AS ts FROM {audit_tbl} WHERE job_name = '{JOB_NAME}'").collect()[0]
-        if row.ts:
-            return row.ts
-    except AnalysisException:
-        pass
-    return datetime.utcnow().replace(microsecond=0)
-
-
-def get_updated_merchants(spark: SparkSession, since_ts: datetime, args: Namespace) -> List[str]:
-    ts_str = since_ts.strftime("%Y-%m-%d %H:%M:%S")
-    query = f"""
-        WITH updated_merchants AS (
-            SELECT merchant_id FROM {args.erp_po_tbl} WHERE ingestion_ts >= TIMESTAMP('{ts_str}')
-            UNION
-            SELECT merchant_id FROM {args.erp_invoice_tbl} WHERE ingestion_ts >= TIMESTAMP('{ts_str}')
-            UNION
-            SELECT merchant_id FROM {args.erp_suppliers_tbl} WHERE ingestion_ts >= TIMESTAMP('{ts_str}')
-            UNION
-            SELECT merchant_id FROM {args.erp_payments_tbl} WHERE ingestion_ts >= TIMESTAMP('{ts_str}')
-        )
-        SELECT DISTINCT merchant_id FROM updated_merchants WHERE merchant_id IS NOT NULL
-    """
-    df = spark.sql(query)
-    return [r.merchant_id for r in df.collect()]
-
-
-def get_merchants_to_be_processed(spark: SparkSession, args: Namespace) -> List[str]:
-    last_success = get_last_success_dt(spark, args.workflow_audit_tbl)
-    print(f"Last success timestamp: {last_success}")
-    merchant_ids = get_updated_merchants(spark, last_success, args)
-    if len(merchant_ids) > args.max_merchant_ids:
-        print(f"Merchant list truncated from {len(merchant_ids)} to {args.max_merchant_ids}")
-        merchant_ids = merchant_ids[:args.max_merchant_ids]
-    print(f"Processing merchants count={len(merchant_ids)}")
-    return merchant_ids
-
-
 def get_supplier_info(spark: SparkSession, args: Namespace, merchant_ids_str: str):
     """Fetches latest updated supplier details """
     query = f"""WITH ranked AS (
             SELECT *,
-                   ROW_NUMBER() OVER (PARTITION BY supplier_id ORDER BY ingestion_ts DESC) AS rn
+                   ROW_NUMBER() OVER (PARTITION BY merchant_id, supplier_id ORDER BY ingestion_ts DESC) AS rn
             FROM {args.erp_suppliers_tbl}
             WHERE merchant_id IN ({merchant_ids_str})
               AND soft_delete = false
@@ -143,7 +112,7 @@ def get_payment_info(spark: SparkSession, args: Namespace, merchant_ids_str: str
     query = f"""SELECT p.*, pm.sme_payment_method AS mapped_payment_method
         FROM {args.erp_payments_tbl} p
         LEFT JOIN {args.payment_mapping_tbl} pm
-          ON LOWER(p.payment_method) = LOWER(pm.src_payment_method)
+          ON LOWER(TRIM(p.payment_method)) = LOWER(pm.src_payment_method)
         WHERE merchant_id IN ({merchant_ids_str}) AND modified_date >= CURRENT_DATE - INTERVAL 365 DAYS AND soft_delete = false"""
     payment_df = spark.sql(query)
     return payment_df
@@ -155,15 +124,15 @@ def agg_invoice(spark: SparkSession, invoice_df: DataFrame):
     agg_query = """SELECT 'monthly' AS date_period, merchant_id, supplier_id,
                collect_set(payment_terms) AS payment_terms,
                COUNT(*) AS total_number_of_invoices,
-               COUNT(CASE WHEN UPPER(status) IN ("PAID", "SUBMITTED", "PARTIALLY_PAID", "OPEN") THEN 1 END) AS total_number_of_payments_paid_tbg,
+               COUNT(CASE WHEN UPPER(TRIM(status)) IN ("PAID", "SUBMITTED", "PARTIALLY_PAID", "OPEN") THEN 1 END) AS total_number_of_payments_paid_tbg,
                SUM(COALESCE(amount, 0)) AS total_amount_of_invoices,
-               COUNT(CASE WHEN UPPER(status)='PAID' THEN 1 END) AS total_number_of_payments_paid,
-               SUM(CASE WHEN UPPER(status)='PAID' THEN COALESCE(amount, 0) ELSE 0 END) AS total_amount_of_payments_paid,
-               COUNT(CASE WHEN UPPER(status) IN ('OPEN', 'SUBMITTED') AND due_date < CURRENT_DATE THEN 1 END) AS total_number_of_payments_due,
-               SUM(CASE WHEN UPPER(status) IN ('OPEN', 'SUBMITTED') AND due_date < CURRENT_DATE THEN COALESCE(amount, 0) ELSE 0 END) AS total_amount_of_payments_due,
-               COUNT(CASE WHEN UPPER(status)='OPEN' THEN 1 END) AS total_number_of_payments_open,
-               SUM(CASE WHEN UPPER(status)='OPEN' THEN COALESCE(amount, 0) ELSE 0 END) AS total_amount_of_payments_open,
-               MIN(CASE WHEN UPPER(status) IN ('SUBMITTED', 'OPEN') AND due_date >= CURRENT_DATE THEN due_date END) AS next_payment_date
+               COUNT(CASE WHEN UPPER(TRIM(status))='PAID' THEN 1 END) AS total_number_of_payments_paid,
+               SUM(CASE WHEN UPPER(TRIM(status))='PAID' THEN COALESCE(amount, 0) ELSE 0 END) AS total_amount_of_payments_paid,
+               COUNT(CASE WHEN UPPER(TRIM(status)) IN ('OPEN', 'SUBMITTED') AND due_date < CURRENT_DATE THEN 1 END) AS total_number_of_payments_due,
+               SUM(CASE WHEN UPPER(TRIM(status)) IN ('OPEN', 'SUBMITTED') AND due_date < CURRENT_DATE THEN COALESCE(amount, 0) ELSE 0 END) AS total_amount_of_payments_due,
+               COUNT(CASE WHEN UPPER(TRIM(status))='OPEN' THEN 1 END) AS total_number_of_payments_open,
+               SUM(CASE WHEN UPPER(TRIM(status))='OPEN' THEN COALESCE(amount, 0) ELSE 0 END) AS total_amount_of_payments_open,
+               MIN(CASE WHEN UPPER(TRIM(status)) IN ('SUBMITTED', 'OPEN') AND due_date >= CURRENT_DATE THEN due_date END) AS next_payment_date
         FROM invoice_data
         WHERE modified_date >= CURRENT_DATE - INTERVAL 30 DAYS
         GROUP BY merchant_id, supplier_id
@@ -171,15 +140,15 @@ def agg_invoice(spark: SparkSession, invoice_df: DataFrame):
         SELECT 'quarterly' AS date_period, merchant_id, supplier_id,
                collect_set(payment_terms) AS payment_terms,
                COUNT(*) AS total_number_of_invoices,
-               COUNT(CASE WHEN UPPER(status) IN ("PAID", "SUBMITTED", "PARTIALLY_PAID", "OPEN") THEN 1 END) AS total_number_of_payments_paid_tbg,
+               COUNT(CASE WHEN UPPER(TRIM(status)) IN ("PAID", "SUBMITTED", "PARTIALLY_PAID", "OPEN") THEN 1 END) AS total_number_of_payments_paid_tbg,
                SUM(COALESCE(amount, 0)) AS total_amount_of_invoices,
-               COUNT(CASE WHEN UPPER(status)='PAID' THEN 1 END) AS total_number_of_payments_paid,
-               SUM(CASE WHEN UPPER(status)='PAID' THEN COALESCE(amount, 0) ELSE 0 END) AS total_amount_of_payments_paid,
-               COUNT(CASE WHEN UPPER(status) IN ('OPEN', 'SUBMITTED') AND due_date < CURRENT_DATE THEN 1 END) AS total_number_of_payments_due,
-               SUM(CASE WHEN UPPER(status) IN ('OPEN', 'SUBMITTED') AND due_date < CURRENT_DATE THEN COALESCE(amount, 0) ELSE 0 END) AS total_amount_of_payments_due,
-               COUNT(CASE WHEN UPPER(status)='OPEN' THEN 1 END) AS total_number_of_payments_open,
-               SUM(CASE WHEN UPPER(status)='OPEN' THEN COALESCE(amount, 0) ELSE 0 END) AS total_amount_of_payments_open,
-               MIN(CASE WHEN UPPER(status) IN ('SUBMITTED', 'OPEN') AND due_date >= CURRENT_DATE THEN due_date END) AS next_payment_date
+               COUNT(CASE WHEN UPPER(TRIM(status))='PAID' THEN 1 END) AS total_number_of_payments_paid,
+               SUM(CASE WHEN UPPER(TRIM(status))='PAID' THEN COALESCE(amount, 0) ELSE 0 END) AS total_amount_of_payments_paid,
+               COUNT(CASE WHEN UPPER(TRIM(status)) IN ('OPEN', 'SUBMITTED') AND due_date < CURRENT_DATE THEN 1 END) AS total_number_of_payments_due,
+               SUM(CASE WHEN UPPER(TRIM(status)) IN ('OPEN', 'SUBMITTED') AND due_date < CURRENT_DATE THEN COALESCE(amount, 0) ELSE 0 END) AS total_amount_of_payments_due,
+               COUNT(CASE WHEN UPPER(TRIM(status))='OPEN' THEN 1 END) AS total_number_of_payments_open,
+               SUM(CASE WHEN UPPER(TRIM(status))='OPEN' THEN COALESCE(amount, 0) ELSE 0 END) AS total_amount_of_payments_open,
+               MIN(CASE WHEN UPPER(TRIM(status)) IN ('SUBMITTED', 'OPEN') AND due_date >= CURRENT_DATE THEN due_date END) AS next_payment_date
         FROM invoice_data
         WHERE modified_date >= CURRENT_DATE - INTERVAL 90 DAYS
         GROUP BY merchant_id, supplier_id
@@ -187,15 +156,15 @@ def agg_invoice(spark: SparkSession, invoice_df: DataFrame):
         SELECT 'yearly' AS date_period, merchant_id, supplier_id,
                collect_set(payment_terms) AS payment_terms,
                COUNT(*) AS total_number_of_invoices,
-               COUNT(CASE WHEN UPPER(status) IN ("PAID", "SUBMITTED", "PARTIALLY_PAID", "OPEN") THEN 1 END) AS total_number_of_payments_paid_tbg,
+               COUNT(CASE WHEN UPPER(TRIM(status)) IN ("PAID", "SUBMITTED", "PARTIALLY_PAID", "OPEN") THEN 1 END) AS total_number_of_payments_paid_tbg,
                SUM(COALESCE(amount, 0)) AS total_amount_of_invoices,
-               COUNT(CASE WHEN UPPER(status)='PAID' THEN 1 END) AS total_number_of_payments_paid,
-               SUM(CASE WHEN UPPER(status)='PAID' THEN COALESCE(amount, 0) ELSE 0 END) AS total_amount_of_payments_paid,
-               COUNT(CASE WHEN UPPER(status) IN ('OPEN', 'SUBMITTED') AND due_date < CURRENT_DATE THEN 1 END) AS total_number_of_payments_due,
-               SUM(CASE WHEN UPPER(status) IN ('OPEN', 'SUBMITTED') AND due_date < CURRENT_DATE THEN COALESCE(amount, 0) ELSE 0 END) AS total_amount_of_payments_due,
-               COUNT(CASE WHEN UPPER(status)='OPEN' THEN 1 END) AS total_number_of_payments_open,
-               SUM(CASE WHEN UPPER(status)='OPEN' THEN COALESCE(amount, 0) ELSE 0 END) AS total_amount_of_payments_open,
-               MIN(CASE WHEN UPPER(status) IN ('SUBMITTED', 'OPEN') AND due_date >= CURRENT_DATE THEN due_date END) AS next_payment_date
+               COUNT(CASE WHEN UPPER(TRIM(status))='PAID' THEN 1 END) AS total_number_of_payments_paid,
+               SUM(CASE WHEN UPPER(TRIM(status))='PAID' THEN COALESCE(amount, 0) ELSE 0 END) AS total_amount_of_payments_paid,
+               COUNT(CASE WHEN UPPER(TRIM(status)) IN ('OPEN', 'SUBMITTED') AND due_date < CURRENT_DATE THEN 1 END) AS total_number_of_payments_due,
+               SUM(CASE WHEN UPPER(TRIM(status)) IN ('OPEN', 'SUBMITTED') AND due_date < CURRENT_DATE THEN COALESCE(amount, 0) ELSE 0 END) AS total_amount_of_payments_due,
+               COUNT(CASE WHEN UPPER(TRIM(status))='OPEN' THEN 1 END) AS total_number_of_payments_open,
+               SUM(CASE WHEN UPPER(TRIM(status))='OPEN' THEN COALESCE(amount, 0) ELSE 0 END) AS total_amount_of_payments_open,
+               MIN(CASE WHEN UPPER(TRIM(status)) IN ('SUBMITTED', 'OPEN') AND due_date >= CURRENT_DATE THEN due_date END) AS next_payment_date
         FROM invoice_data GROUP BY merchant_id, supplier_id"""
     agg_invoice_df = spark.sql(agg_query)
     return agg_invoice_df
@@ -205,18 +174,18 @@ def get_po_agg(spark: SparkSession, po_df: DataFrame):
     """Aggregates purchase order data to get monthly, quarterly and yearly aggregations"""
     po_df.createOrReplaceTempView("purchase_order_data")
     po_agg_query = """SELECT 'monthly' AS date_period, merchant_id, supplier_id,
-               COUNT(CASE WHEN UPPER(status) IN ('SUBMITTED', 'AUTHORIZED', 'BILLED') THEN 1 END) AS total_number_of_purchase_orders,
-               SUM(CASE WHEN UPPER(status) IN ('SUBMITTED', 'AUTHORIZED', 'BILLED') THEN COALESCE(amount, 0) END) AS total_amount_of_purchase_orders
+               COUNT(CASE WHEN UPPER(TRIM(status)) IN ('SUBMITTED', 'AUTHORIZED', 'BILLED') THEN 1 END) AS total_number_of_purchase_orders,
+               SUM(CASE WHEN UPPER(TRIM(status)) IN ('SUBMITTED', 'AUTHORIZED', 'BILLED') THEN COALESCE(amount, 0) END) AS total_amount_of_purchase_orders
         FROM purchase_order_data WHERE modified_date >= CURRENT_DATE - INTERVAL 30 DAYS GROUP BY merchant_id, supplier_id
         UNION ALL
         SELECT 'quarterly' AS date_period, merchant_id, supplier_id,
-            COUNT(CASE WHEN UPPER(status) IN ('SUBMITTED', 'AUTHORIZED', 'BILLED') THEN 1 END) AS total_number_of_purchase_orders,
-            SUM(CASE WHEN UPPER(status) IN ('SUBMITTED', 'AUTHORIZED', 'BILLED') THEN COALESCE(amount, 0) END) AS total_amount_of_purchase_orders
+            COUNT(CASE WHEN UPPER(TRIM(status)) IN ('SUBMITTED', 'AUTHORIZED', 'BILLED') THEN 1 END) AS total_number_of_purchase_orders,
+            SUM(CASE WHEN UPPER(TRIM(status)) IN ('SUBMITTED', 'AUTHORIZED', 'BILLED') THEN COALESCE(amount, 0) END) AS total_amount_of_purchase_orders
         FROM purchase_order_data WHERE modified_date >= CURRENT_DATE - INTERVAL 90 DAYS GROUP BY merchant_id, supplier_id
         UNION ALL
         SELECT 'yearly' AS date_period, merchant_id, supplier_id,
-            COUNT(CASE WHEN UPPER(status) IN ('SUBMITTED', 'AUTHORIZED', 'BILLED') THEN 1 END) AS total_number_of_purchase_orders,
-            SUM(CASE WHEN UPPER(status) IN ('SUBMITTED', 'AUTHORIZED', 'BILLED') THEN COALESCE(amount, 0) END) AS total_amount_of_purchase_orders
+            COUNT(CASE WHEN UPPER(TRIM(status)) IN ('SUBMITTED', 'AUTHORIZED', 'BILLED') THEN 1 END) AS total_number_of_purchase_orders,
+            SUM(CASE WHEN UPPER(TRIM(status)) IN ('SUBMITTED', 'AUTHORIZED', 'BILLED') THEN COALESCE(amount, 0) END) AS total_amount_of_purchase_orders
         FROM purchase_order_data GROUP BY merchant_id, supplier_id"""
     agg_po_df = spark.sql(po_agg_query)
     return agg_po_df
@@ -228,11 +197,12 @@ def payment_agg(spark: SparkSession, payment_df: DataFrame):
     payment_agg_query = """SELECT 'monthly' AS date_period, merchant_id, supplier_id,
                collect_set(mapped_payment_method) AS payment_method,
                COUNT(*) AS totalNumberOfPayments,
+               COUNT(DISTINCT CASE WHEN UPPER(mapped_payment_method) = 'CARD' THEN supplier_id END) AS total_number_of_card_accepting_suppliers,
                SUM(COALESCE(amount, 0)) AS total_amount_spend,
                SUM(CASE WHEN UPPER(mapped_payment_method)='CARD' THEN COALESCE(amount, 0) ELSE 0 END) AS total_spent_by_card,
                SUM(CASE WHEN UPPER(mapped_payment_method)='CHECK' THEN COALESCE(amount, 0) ELSE 0 END) AS total_spent_by_cheque,
                SUM(CASE WHEN UPPER(mapped_payment_method)='ACH' THEN COALESCE(amount, 0) ELSE 0 END) AS total_spent_by_ach,
-               SUM(CASE WHEN UPPER(mapped_payment_method) NOT IN ('CARD', 'CHECK', 'ACH') OR payment_method is NULL THEN COALESCE(amount, 0) ELSE 0 END) AS total_spent_by_other
+               SUM(CASE WHEN UPPER(mapped_payment_method) NOT IN ('CARD', 'CHECK', 'ACH') OR mapped_payment_method is NULL THEN COALESCE(amount, 0) ELSE 0 END) AS total_spent_by_other
         FROM payment_data
         WHERE modified_date >= CURRENT_DATE - INTERVAL 30 DAYS
         GROUP BY merchant_id, supplier_id
@@ -240,11 +210,12 @@ def payment_agg(spark: SparkSession, payment_df: DataFrame):
         SELECT 'quarterly' AS date_period, merchant_id, supplier_id,
                collect_set(mapped_payment_method) AS payment_method,
                COUNT(*) AS totalNumberOfPayments,
+               COUNT(DISTINCT CASE WHEN UPPER(mapped_payment_method) = 'CARD' THEN supplier_id END) AS total_number_of_card_accepting_suppliers,
                SUM(COALESCE(amount, 0)) AS total_amount_spend,
                SUM(CASE WHEN UPPER(mapped_payment_method)='CARD' THEN COALESCE(amount, 0) ELSE 0 END) AS total_spent_by_card,
                SUM(CASE WHEN UPPER(mapped_payment_method)='CHECK' THEN COALESCE(amount, 0) ELSE 0 END) AS total_spent_by_cheque,
                SUM(CASE WHEN UPPER(mapped_payment_method)='ACH' THEN COALESCE(amount, 0) ELSE 0 END)  AS total_spent_by_ach,
-               SUM(CASE WHEN UPPER(mapped_payment_method) NOT IN ('CARD', 'CHECK', 'ACH') OR payment_method is NULL THEN COALESCE(amount, 0) ELSE 0 END) AS total_spent_by_other
+               SUM(CASE WHEN UPPER(mapped_payment_method) NOT IN ('CARD', 'CHECK', 'ACH') OR mapped_payment_method is NULL THEN COALESCE(amount, 0) ELSE 0 END) AS total_spent_by_other
         FROM payment_data
         WHERE modified_date >= CURRENT_DATE - INTERVAL 90 DAYS
         GROUP BY merchant_id, supplier_id
@@ -252,11 +223,12 @@ def payment_agg(spark: SparkSession, payment_df: DataFrame):
         SELECT 'yearly' AS date_period, merchant_id, supplier_id,
                collect_set(mapped_payment_method) AS payment_method,
                COUNT(*) AS totalNumberOfPayments,
+               COUNT(DISTINCT CASE WHEN UPPER(mapped_payment_method) = 'CARD' THEN supplier_id END) AS total_number_of_card_accepting_suppliers,
                SUM(COALESCE(amount, 0)) AS total_amount_spend,
                SUM(CASE WHEN UPPER(mapped_payment_method)='CARD' THEN COALESCE(amount, 0) ELSE 0 END) AS total_spent_by_card,
                SUM(CASE WHEN UPPER(mapped_payment_method)='CHECK' THEN COALESCE(amount, 0) ELSE 0 END) AS total_spent_by_cheque,
                SUM(CASE WHEN UPPER(mapped_payment_method)='ACH' THEN COALESCE(amount, 0) ELSE 0 END) AS total_spent_by_ach,
-               SUM(CASE WHEN UPPER(mapped_payment_method) NOT IN ('CARD', 'CHECK', 'ACH') OR payment_method is NULL THEN COALESCE(amount, 0) ELSE 0 END) AS total_spent_by_other
+               SUM(CASE WHEN UPPER(mapped_payment_method) NOT IN ('CARD', 'CHECK', 'ACH') OR mapped_payment_method is NULL THEN COALESCE(amount, 0) ELSE 0 END) AS total_spent_by_other
         FROM payment_data
         GROUP BY merchant_id, supplier_id"""
     payment_agg_df = spark.sql(payment_agg_query)
@@ -278,12 +250,13 @@ def join_final_metrics(spark: SparkSession, supplier_df: DataFrame, invoice_agg_
             s.city,
             s.state,
             s.postal_code,
-            "USA" AS country,
+            s.country,
             s.phone_number,
             s.email_address,
             s.currency,
             s.issuer_id,
             p.payment_method,
+            p.total_number_of_card_accepting_suppliers,
             i.payment_terms,
             COALESCE(i.total_number_of_invoices,0) AS total_number_of_invoices,
             COALESCE(i.total_number_of_payments_paid_tbg,0) AS total_number_of_payments_paid_tbg,
@@ -316,18 +289,16 @@ def join_final_metrics(spark: SparkSession, supplier_df: DataFrame, invoice_agg_
 
 def agg_erp_metrics(spark: SparkSession, merchant_ids, args):
     """Gets all aggregation for final aggregations metrics."""
+    logging.info(f"Aggregating ERP metrics for merchant_ids {merchant_ids}")
     merchant_ids_str = ",".join(f"'{item}'" for item in merchant_ids)
     supplier_df = get_supplier_info(spark, args, merchant_ids_str)
     invoice_df = get_invoice_info(spark, args, merchant_ids_str)
     po_df = get_po_info(spark, args, merchant_ids_str)
     payment_df = get_payment_info(spark, args, merchant_ids_str)
-
     invoice_agg_df = agg_invoice(spark, invoice_df)
     po_agg_df = get_po_agg(spark, po_df)
     payment_agg_df = payment_agg(spark, payment_df)
-
     final_df = join_final_metrics(spark, supplier_df, invoice_agg_df, po_agg_df, payment_agg_df)
-
     return final_df
 
 
@@ -338,7 +309,7 @@ def get_erp_merchant_agg(spark: SparkSession, df: DataFrame):
     WITH
     -- Total Payments per Merchant
     payments_per_merchant AS (
-        SELECT merchant_id, date_period, SUM(total_number_of_payments_paid) AS all_suppliers_total_number_of_payments FROM erp_merchant_supplier_agg GROUP BY merchant_id, date_period
+        SELECT merchant_id, date_period, SUM(COALESCE(total_number_of_payments_paid,0) + COALESCE(total_number_of_payments_open,0) ) AS all_suppliers_total_number_of_payments FROM erp_merchant_supplier_agg GROUP BY merchant_id, date_period
     ),
     -- Total Suppliers per Merchant
     suppliers_per_merchant AS (
@@ -350,7 +321,7 @@ def get_erp_merchant_agg(spark: SparkSession, df: DataFrame):
     ),
     -- Total Number of suppliers accepting cards
     card_accepting_suppliers AS (
-        SELECT merchant_id, date_period, count(distinct supplier_id) AS all_suppliers_card_accepting_suppliers FROM erp_merchant_supplier_agg WHERE propensity_score is NOT NULL GROUP BY merchant_id, date_period
+        SELECT merchant_id, date_period, COALESCE(COUNT(DISTINCT CASE WHEN total_number_of_card_accepting_suppliers != 0 THEN supplier_id END), 0) AS all_suppliers_card_accepting_suppliers FROM erp_merchant_supplier_agg GROUP BY merchant_id, date_period
     )
     SELECT
         s.*,
@@ -379,34 +350,10 @@ def upsert_gold_table(spark: SparkSession, gold_tbl: str, df: DataFrame, merchan
             spark.sql(f"DELETE FROM {gold_tbl} WHERE merchant_id IN ({merchant_ids_str})")
     except AnalysisException:
         if not spark.catalog.tableExists(gold_tbl):
-            print(f"Gold table {gold_tbl} not found; will create on write...")
+            logging.info(f"Gold table {gold_tbl} not found; will create on write...")
         else:
             raise
     df.write.mode("append").saveAsTable(gold_tbl)
-
-
-def merge_workflow_audit(spark: SparkSession, audit_tbl: str, start_dt: datetime):
-    try:
-        spark.sql(f"""
-        MERGE INTO {audit_tbl} AS target
-        USING (SELECT '{JOB_NAME}' AS job_name,
-                      current_timestamp() AS last_success_dt,
-                      'SUCCESS' AS status,
-                      '' AS comment,
-                      TIMESTAMP('{start_dt.strftime("%Y-%m-%d %H:%M:%S")}') AS start_dt) AS source
-          ON target.job_name = source.job_name
-        WHEN MATCHED THEN UPDATE SET
-            target.last_success_dt = source.last_success_dt,
-            target.status = source.status,
-            target.comment = source.comment,
-            target.start_dt = source.start_dt
-        WHEN NOT MATCHED THEN
-          INSERT (job_name, last_success_dt, status, comment, start_dt)
-          VALUES (source.job_name, source.last_success_dt, source.status, source.comment, source.start_dt)
-        """)
-    except Exception as e:
-        print(f"failed to merge, inserting instead... {e}")
-        spark.sql(f"INSERT INTO {audit_tbl} VALUES ('{JOB_NAME}', current_timestamp(), TIMESTAMP('{start_dt.strftime('%Y-%m-%d %H:%M:%S')}'), '', '')")
 
 
 def write_process_audit(spark: SparkSession, process_audit_tbl: str, merchant_ids: List[str], start_dt: datetime, end_dt: datetime):
@@ -424,7 +371,8 @@ def write_process_audit(spark: SparkSession, process_audit_tbl: str, merchant_id
 
 def matching(spark: SparkSession, input_df: DataFrame, args: Namespace) -> DataFrame:
     if args.match_type.lower() == "reltio":
-        from reltio_matcher import perform_matching
+        # from reltio_matcher import perform_matching
+        from reltio_matching_service import perform_matching
         return perform_matching(spark, input_df, args)
     elif args.match_type.lower() == "in-house":
         from in_house_matcher import match_with_audit
@@ -433,25 +381,88 @@ def matching(spark: SparkSession, input_df: DataFrame, args: Namespace) -> DataF
         raise ValueError(f"Unknown match type: {args.match_type}")
 
 
-def run_pipeline(spark, args: Namespace) -> int:
-    start_ts = datetime.utcnow()
-    print("Fetching Updated Merchant ids")
-    merchant_ids = get_merchants_to_be_processed(spark, args)
-    if not merchant_ids:
-        print("No merchants updated. Exiting.")
-        return 0
+def update_erp_run_audit(spark, tracker_tbl: str, run_id: str, merchant_ids: list, start_time, status: str, msg: str = None) -> None:
+    logging.info(f"[AUDIT] Updating {tracker_tbl} | run_id={run_id} | status={status} | Merchant ids ={merchant_ids} | msg={msg}")
+    merchants_sql = ",".join([f"{m}" for m in merchant_ids])
+    try:
+        now = datetime.now()
+        duration = round((now - start_time).total_seconds(), 2)
 
-    print("Performing Raw Data aggregations.")
+        # Safe values
+        safe_run_id = run_id.replace("'", "''")
+        safe_status = status.replace("'", "''")
+        safe_msg = (msg or "")[:5000].replace("'", "''")
+        spark.sql(f"""
+                MERGE INTO {tracker_tbl} AS tgt
+                USING (
+                    SELECT
+                        '{safe_run_id}'                  AS run_id,
+                        '{merchants_sql}'                AS merchant_ids,
+                        {len(merchant_ids)}              AS number_of_merchants,
+                        TIMESTAMP('{start_time.strftime('%Y-%m-%d %H:%M:%S')}') AS start_time,
+                        TIMESTAMP('{now.strftime('%Y-%m-%d %H:%M:%S')}')        AS end_time,
+                        {duration}                       AS time_taken_seconds,
+                        '{safe_status}'                  AS status,
+                        '{safe_msg}'                     AS error_message,
+                        current_timestamp()              AS updated_at
+                ) src
+                ON tgt.run_id = src.run_id
+                WHEN MATCHED THEN UPDATE SET
+                    tgt.end_time             = src.end_time,
+                    tgt.time_taken_seconds   = src.time_taken_seconds,
+                    tgt.status               = src.status,
+                    tgt.error_message        = src.error_message,
+                    tgt.updated_at           = src.updated_at
+                WHEN NOT MATCHED THEN INSERT (run_id, merchant_ids, number_of_merchants, start_time, end_time, time_taken_seconds, status, error_message, updated_at)
+                VALUES (src.run_id, src.merchant_ids, src.number_of_merchants, src.start_time, src.end_time, src.time_taken_seconds, src.status, src.error_message, current_timestamp())
+            """)
+    except Exception as e:
+        # Last-resort fallback
+        logging.info(f"[AUDIT][ERROR] Merge failed, inserting fallback row: {e}")
+        spark.sql(f"""
+            INSERT INTO {tracker_tbl} (run_id, merchant_ids, start_time, status, error_message, updated_at)
+            VALUES ('{run_id}', '{merchants_sql}', TIMESTAMP('{start_time.strftime('%Y-%m-%d %H:%M:%S')}'), '{status}', '{(msg or str(e)).replace("'", "''")[:5000]}', current_timestamp()) """)
+
+
+def run_pipeline(spark, args: Namespace, merchant_ids, start_time, run_id) -> int:
+    logging.info(f"Updating audit tracker table {args.erp_tracker_tbl}")
+    update_erp_run_audit(spark=spark, tracker_tbl=args.erp_tracker_tbl, run_id=run_id, merchant_ids=merchant_ids, start_time=start_time, status="RUNNING")
+    logging.info("Performing Raw Data aggregations.")
     agg_df = agg_erp_metrics(spark, merchant_ids, args)
 
     unique_agg_supp_df = agg_df.dropDuplicates(["supplier_id", "supplier_name", "state", "city", "postal_code", "country", "street_address"])
-    print("Performing Matching")
+    logging.info("Performing Matching...")
     matched_result_df = matching(spark, unique_agg_supp_df, args)
     matched_df = agg_df.join(matched_result_df, "supplier_id", "left")
+    mch_df = spark.read.table(args.member_catgry_hier_tbl)
+    matched_df = (matched_df.join(mch_df, matched_df["matched_mmc_code"] == mch_df["mcc_code"], how="left")
+                  .withColumn("mcc_code", F.coalesce(F.col("mcc_code"), F.col("matched_mmc_code"))))
 
     confidence_col = when(col('matched_score') >= 0.75, "High").when((col('matched_score') < 0.75) & (col('matched_score') >= 0.70), "Medium").otherwise("Low")
-    print(f"Joining with merchant aggregate summary table.{args.mer_summary_tbl}")
-    mer_agg_summ_df = matched_df.join(spark.read.table(args.mer_summary_tbl), on="entity_id", how="left")
+    logging.info(f"Joining with merchant aggregate summary table.{args.mer_summary_tbl}")
+    mer_summ_cols = ["entity_id", "preferred_payment_method", "propensity_score", "transaction_recency", "suggested_talking_points",
+                     "commercial_history", "commercial_recency", "avg_tran_amt", "matched_trans_count", "in_control_history", "in_control_recency",
+                     "propensity_score_label", "mmh_id", "card_acceptor"]
+    mer_summary_df = spark.read.table(args.mer_summary_tbl).select(*mer_summ_cols)
+    mer_summary_df = mer_summary_df.withColumnRenamed("entity_id", "mer_summary_entity_id")
+    # mer_agg_summ_df = matched_df.join(mer_summary_df, on="entity_id", how="left")
+    mer_agg_summ_df = (matched_df.join(mer_summary_df, matched_df.matched_mmhid == mer_summary_df.mmh_id, how="left")
+                       .withColumn("mmh_id", F.coalesce(F.col("mmh_id"), F.col("matched_mmhid"))))
+    mer_agg_summ_df = (mer_agg_summ_df.withColumnRenamed("matched_url", "supplier_website_url")
+                       .withColumnRenamed("matched_sic", "sic").withColumnRenamed("matched_street_address", "cleansed_address_line_1")
+                       .withColumnRenamed("matched_city", "cleansed_city_name").withColumnRenamed("matched_state", "Cleansed_state_Or_province_name")
+                       .withColumnRenamed("matched_country_cd", "cleansed_country_code").withColumnRenamed("matched_postal_code", "cleansed_postal_code")
+                       .withColumnRenamed("matched_agg_merch_name", "aggregate_merchant_name")
+                       .withColumnRenamed("matched_agg_merch_id", "aggregate_merchant_id")
+                       .withColumnRenamed("matched_parent_agg_merch_name", "parent_aggregate_merchant_name")
+                       .withColumnRenamed("matched_parent_agg_merch_id", "parent_aggregate_merchant_id")
+                       .withColumnRenamed("matched_clearing_last_seen_date", "clearing_last_seen_date")
+                       .withColumnRenamed("matched_auth_last_seen_date", "auth_last_seen_date")
+                       .withColumnRenamed("matched_zi_c_last_updated_date", "last_update_date")
+                       .withColumnRenamed("matched_naics", "customer_naics").withColumnRenamed("matched_region_code", "dw_merch_region_cd")
+                       .withColumnRenamed("matched_industry", "industry")
+                       .withColumn("supplier_alias_name", col("matched_dba_name")).withColumn("cleansed_supplier_name", col("matched_dba_name"))
+                       .withColumn("business_region_name", col("matched_region_name")).withColumn("region", col("matched_region_name")))
     result_df = get_erp_merchant_agg(spark, mer_agg_summ_df)
 
     # Adding Confidence, annual_target_spend, transaction_count, average_ticket columns.
@@ -462,57 +473,71 @@ def run_pipeline(spark, args: Namespace) -> int:
                  .withColumn("average_ticket", lit(0).cast(DecimalType(38, 2))).select(required_cols))
 
     validate_result(result_df)
-    print(f"Inserting to GOLD table {args.so_erp_bd_tbl}")
+    logging.info(f"Inserting to GOLD table {args.so_erp_bd_tbl}")
     upsert_gold_table(spark, args.so_erp_bd_tbl, result_df, merchant_ids)
-    print(f"Merging workflow audit table {args.workflow_audit_tbl}")
-    merge_workflow_audit(spark, args.workflow_audit_tbl, start_ts)
-    print(f"Updateing process audit table {args.process_audit_tbl}")
-    write_process_audit(spark, args.process_audit_tbl, merchant_ids, start_ts, datetime.utcnow())
     print("ERP pipeline completed successfully.")
     return 0
 
 
 def parse_args(argv: List[str]) -> argparse.Namespace:  # pragma no cover
     p = argparse.ArgumentParser(description="ERP Pipeline Job")
+    p.add_argument("--merchant-ids", required=True)
     p.add_argument("--erp-payments-tbl", default="mc_sme.bd.erp_payments_raw", help="ERP payments raw table")
     p.add_argument("--erp-suppliers-tbl", default="mc_sme.bd.erp_suppliers_raw", help="ERP suppliers raw table")
     p.add_argument("--erp-invoice-tbl", default="mc_sme.bd.erp_invoices_raw", help="ERP invoices raw table")
     p.add_argument("--erp-po-tbl", default="mc_sme.bd.erp_purchase_orders_raw", help="ERP purchase order raw table")
     p.add_argument("--payment_mapping_tbl", default="mc_sme.bd.payment_mapping", help="Payment methods mapping table for AP/ERP")
-    p.add_argument("--workflow-audit-tbl", required=True)
-    p.add_argument("--process-audit-tbl", required=True, help="ERP process audit tracker table")
+    p.add_argument("--erp-tracker-tbl", required=True, help="ERP process audit tracker table")
     p.add_argument("--mer-summary-tbl", required=True, help="Merchant summary (mer_summary_tbl)")
+    p.add_argument("--member-catgry-hier-tbl", required=True)
     p.add_argument("--reltio-match-audit-tbl", required=True, help="Match cache / audit table (for joining)")
     p.add_argument("--so-erp-bd-tbl", required=True, help="Final ERP merchant supplier aggregation table")
     p.add_argument("--max-merchant-ids", type=int, default=5000, help="Safety cap to avoid giant IN clauses")
     p.add_argument("--reltio-match-url", required=True, help="https://.../entities/_matches")
+    p.add_argument("--reltio-search-url", required=True, help="https://.../entities/_matches")
+    p.add_argument("--reltio-auth-url", required=True, help="https://.../entities/_matches")
+    p.add_argument("--reltio-secret-name", required=True, help="aws secret name for reltio access token")
     p.add_argument("--match-batch-size", type=int, default=200)
     p.add_argument("--match-max-concurrent-batches", type=int, default=5)
     p.add_argument("--match-max-retries", type=int, default=3)
     p.add_argument("--match-backoff-secs", type=float, default=1.0)
-    p.add_argument("--match-connect-timeout", type=int, default=5)
+    p.add_argument("--match-connect-timeout", type=int, default=120)
     p.add_argument("--match-read-timeout", type=int, default=60)
     p.add_argument("--match-cache-expiry", type=int, default=7)
+    p.add_argument("--search-max-workers", type=int, default=50)
+    p.add_argument("--min-match-score", type=float, default=0.80)
     p.add_argument("--match-type", default="reltio", help="either reltio or in-house")
     p.add_argument("--model-path", default="", help="model path for in-house matcher")
     p.add_argument("--src-clustered-tbl", default="", help="src_clustered_tbl for in-house matcher")
     p.add_argument("--in-house-audit-tbl", default="", help="audit table for in-house matcher")
+    p.add_argument("--job-run-id", help="The Databricks Job Run ID")
+    p.add_argument("--country-map-table", default="mc_sme.bd.country_map")
+    p.add_argument("--country-alias-map-table", default="mc_sme.bd.country_alias_map")
+
     return p.parse_args(argv)
 
 
-def main() -> None:  # pragma no cover
+def main() -> None:
     args = parse_args(sys.argv[1:])
-    print("job started with args:", args)
+    logging.info(f"job started with args:{args}")
+    start_time = datetime.now()
+    merchant_ids = args.merchant_ids.split(",")
+    merchant_ids = [m.strip() for m in merchant_ids]
+    logging.info(f"Merchant ids passed = {merchant_ids}")
+    run_id = args.job_run_id
+    logging.info(f"The current Job Run ID is: {run_id}")
     spark = SparkSession.getActiveSession() or SparkSession.builder.appName("ERP_Pipeline").getOrCreate()
     try:
-        run_pipeline(spark, args)
+        run_pipeline(spark, args, merchant_ids, start_time, run_id)
+        logging.info("Updating audit table with SUCCESS")
+        update_erp_run_audit(spark=spark, tracker_tbl=args.erp_tracker_tbl, run_id=run_id, merchant_ids=merchant_ids, start_time=start_time, status="SUCCEEDED")
+        logging.info("ERP pipeline completed successfully.")
     except Exception as e:
-        print(f"Error occurred during pipeline execution: {e}")
+        logging.error(f"Error occurred during pipeline execution: {e}")
         traceback.print_exc()
+        # Update failed status in run tracking table
+        update_erp_run_audit(spark=spark, tracker_tbl=args.erp_tracker_tbl, run_id=run_id, merchant_ids=merchant_ids, start_time=start_time, status="FAILED", msg=traceback.format_exc())
         sys.exit(1)
-    finally:
-        if spark:
-            spark.stop()
 
 
 if __name__ == "__main__":  # pragma no cover
